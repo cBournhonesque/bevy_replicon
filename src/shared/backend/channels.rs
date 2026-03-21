@@ -84,9 +84,6 @@ impl RepliconChannels {
 
     /// Creates the internal channel family for client-to-server replication.
     ///
-    /// This is used by Milestone 3 internal server-receive machinery.
-    /// The public opt-in API is added later.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn create_client_to_server_replication_channels(
         &mut self,
     ) -> ClientToServerReplicationChannels {
@@ -96,6 +93,22 @@ impl RepliconChannels {
             mutation_acks: self.create_server_channel(Channel::Ordered),
         }
     }
+}
+
+pub(crate) fn ensure_client_to_server_replication_channels(
+    world: &mut World,
+) -> ClientToServerReplicationChannels {
+    if let Some(channels) = world.get_resource::<ClientToServerReplicationChannels>() {
+        return *channels;
+    }
+
+    let channels = {
+        let mut replicon_channels = world.resource_mut::<RepliconChannels>();
+        replicon_channels.create_client_to_server_replication_channels()
+    };
+    world.insert_resource(channels);
+
+    channels
 }
 
 /// Internal reverse-direction replication channels for client-to-server replication.

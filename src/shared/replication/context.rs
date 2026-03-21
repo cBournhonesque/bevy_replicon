@@ -1,4 +1,7 @@
-use bevy::{ecs::entity::EntityHashMap, prelude::*};
+use bevy::{
+    ecs::entity::{EntityHashMap, hash_set::EntityHashSet},
+    prelude::*,
+};
 use bytes::Bytes;
 
 use crate::{
@@ -18,6 +21,8 @@ pub(crate) struct ReceiveContext<'a> {
     pub(crate) update_tick: &'a mut ServerUpdateTick,
     pub(crate) buffered_mutations: &'a mut BufferedMutations,
     pub(crate) mutate_ticks: Option<&'a mut ServerMutateTicks>,
+    pub(crate) source: Option<Entity>,
+    pub(crate) spawned_entities: Option<&'a mut EntityHashSet>,
 }
 
 /// Owned receive-side state for a single upstream sender.
@@ -27,6 +32,7 @@ pub(crate) struct ReceiveState {
     update_tick: ServerUpdateTick,
     buffered_mutations: BufferedMutations,
     mutate_ticks: Option<ServerMutateTicks>,
+    spawned_entities: EntityHashSet,
 }
 
 impl ReceiveState {
@@ -37,18 +43,24 @@ impl ReceiveState {
         }
     }
 
-    pub(crate) fn as_context(&mut self) -> ReceiveContext<'_> {
+    pub(crate) fn as_context(&mut self, source: Entity) -> ReceiveContext<'_> {
         ReceiveContext {
             entity_map: &mut self.entity_map,
             update_tick: &mut self.update_tick,
             buffered_mutations: &mut self.buffered_mutations,
             mutate_ticks: self.mutate_ticks.as_mut(),
+            source: Some(source),
+            spawned_entities: Some(&mut self.spawned_entities),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn mutate_ticks(&self) -> Option<&ServerMutateTicks> {
         self.mutate_ticks.as_ref()
+    }
+
+    pub(crate) fn into_spawned_entities(self) -> EntityHashSet {
+        self.spawned_entities
     }
 }
 
@@ -70,6 +82,8 @@ pub(crate) fn with_receive_context<R>(
                     update_tick: &mut update_tick,
                     buffered_mutations: &mut buffered_mutations,
                     mutate_ticks: mutate_ticks.as_mut(),
+                    source: None,
+                    spawned_entities: None,
                 };
                 let result = f(world, &mut receive);
                 if let Some(mutate_ticks) = mutate_ticks {

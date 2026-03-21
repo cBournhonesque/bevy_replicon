@@ -22,3 +22,12 @@ use bevy::prelude::*;
 #[derive(Component, Default, Reflect, Debug, Clone, Copy)]
 #[reflect(Component)]
 pub struct Replicated;
+
+/// Provenance for entities materialized from client-to-server replication.
+///
+/// Inserted on server-side remote entities that were spawned from a connected
+/// client and stores the server-side [`ConnectedClient`](crate::prelude::ConnectedClient)
+/// entity that originated them.
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Component)]
+pub struct ReplicatedFrom(pub Entity);

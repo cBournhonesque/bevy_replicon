@@ -39,8 +39,8 @@ use crate::{
             client_ticks::ClientTicks,
             context::ReceiveContexts,
             receive::{
-                add_receive_context, receive_replication_from_clients, remove_receive_context,
-                sync_receive_contexts,
+                add_receive_context, enable_receive_from_clients, receive_replication_from_clients,
+                remove_receive_context, sync_receive_contexts,
             },
             rules::ReplicationRules,
             send::{
@@ -86,6 +86,12 @@ pub struct ServerPlugin {
     ///
     /// In practice mutations will live at least `mutations_timeout`, and at most `2*mutations_timeout`.
     pub mutations_timeout: Duration,
+
+    /// Enables ordinary server-to-client replication sending.
+    pub send_to_clients: bool,
+
+    /// Enables receiving client-to-server replication.
+    pub receive_from_clients: bool,
 }
 
 impl ServerPlugin {
@@ -94,7 +100,19 @@ impl ServerPlugin {
         Self {
             tick_schedule: Some(tick_schedule.intern()),
             mutations_timeout: Duration::from_secs(10),
+            send_to_clients: true,
+            receive_from_clients: false,
         }
+    }
+
+    pub const fn with_send_to_clients(mut self, send_to_clients: bool) -> Self {
+        self.send_to_clients = send_to_clients;
+        self
+    }
+
+    pub const fn with_receive_from_clients(mut self, receive_from_clients: bool) -> Self {
+        self.receive_from_clients = receive_from_clients;
+        self
     }
 }
 
@@ -137,42 +155,60 @@ impl Plugin for ServerPlugin {
             .add_observer(handle_disconnect)
             .add_observer(add_receive_context)
             .add_observer(remove_receive_context)
-            .add_observer(check_mutation_ticks)
-            .add_observer(buffer_despawn)
             .add_systems(
                 PreUpdate,
                 (
                     sync_receive_contexts
                         .run_if(resource_exists::<ReceiveContexts>)
                         .run_if(resource_exists::<ClientToServerReplicationChannels>),
-                    receive_acks,
                     receive_replication_from_clients
                         .run_if(resource_exists::<ReceiveContexts>)
                         .run_if(resource_exists::<ClientToServerReplicationChannels>),
-                    cleanup_acks(self.mutations_timeout).run_if(on_timer(self.mutations_timeout)),
                 )
                     .chain()
                     .in_set(ServerSystems::Receive)
                     .run_if(in_state(ServerState::Running)),
             )
-            .add_systems(OnExit(ServerState::Running), reset)
-            .add_systems(
-                PostUpdate,
-                (
-                    prepare_messages,
-                    collect_mappings,
-                    collect_despawns,
-                    collect_removals,
-                    collect_changes,
-                    send_messages,
-                )
-                    .chain()
-                    .run_if(resource_changed::<ServerTick>)
-                    .in_set(ServerSystems::Send)
-                    .run_if(in_state(ServerState::Running)),
-            );
+            .add_systems(OnExit(ServerState::Running), reset);
 
-        if let Some(tick_schedule) = self.tick_schedule {
+        if self.receive_from_clients {
+            enable_receive_from_clients(app);
+        }
+
+        if self.send_to_clients {
+            app.add_observer(check_mutation_ticks)
+                .add_observer(buffer_despawn)
+                .add_systems(
+                    PreUpdate,
+                    (
+                        receive_acks,
+                        cleanup_acks(self.mutations_timeout)
+                            .run_if(on_timer(self.mutations_timeout)),
+                    )
+                        .chain()
+                        .in_set(ServerSystems::Receive)
+                        .run_if(in_state(ServerState::Running)),
+                )
+                .add_systems(
+                    PostUpdate,
+                    (
+                        prepare_messages,
+                        collect_mappings,
+                        collect_despawns,
+                        collect_removals,
+                        collect_changes,
+                        send_messages,
+                    )
+                        .chain()
+                        .run_if(resource_changed::<ServerTick>)
+                        .in_set(ServerSystems::Send)
+                        .run_if(in_state(ServerState::Running)),
+                );
+        }
+
+        if self.send_to_clients
+            && let Some(tick_schedule) = self.tick_schedule
+        {
             debug!("using tick schedule `{tick_schedule:?}`");
             app.add_systems(
                 tick_schedule,
@@ -211,7 +247,7 @@ impl Plugin for ServerPlugin {
             .collect();
 
         // Removal observer without any components will trigger on any removal.
-        if !replicated_ids.is_empty() {
+        if self.send_to_clients && !replicated_ids.is_empty() {
             let mut remove_observer = Observer::new(buffer_removals);
             for id in replicated_ids {
                 remove_observer = remove_observer.with_component(id);

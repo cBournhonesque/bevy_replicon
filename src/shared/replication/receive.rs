@@ -13,10 +13,14 @@ use crate::{
     prelude::*,
     shared::{
         backend::{
-            channels::{ClientChannel, ClientToServerReplicationChannels, ServerChannel},
+            channels::{
+                ClientChannel, ClientToServerReplicationChannels, ServerChannel,
+                ensure_client_to_server_replication_channels,
+            },
             server_messages::ServerMessages,
         },
         replication::{
+            ReplicatedFrom,
             context::{
                 BufferedMutate, ReceiveContext, ReceiveContexts, ReceiveState, with_receive_context,
             },
@@ -40,12 +44,7 @@ use crate::{
 /// This is intentionally crate-private until the public opt-in API lands.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn enable_receive_from_clients(app: &mut App) -> ClientToServerReplicationChannels {
-    let channels = {
-        let mut channels = app.world_mut().resource_mut::<RepliconChannels>();
-        channels.create_client_to_server_replication_channels()
-    };
-
-    app.world_mut().insert_resource(channels);
+    let channels = ensure_client_to_server_replication_channels(app.world_mut());
     app.world_mut().init_resource::<ReceiveContexts>();
     app.world_mut()
         .resource_scope(|world, mut messages: Mut<ServerMessages>| {
@@ -137,7 +136,7 @@ pub(crate) fn receive_replication_from_clients(
                         .entry(client)
                         .or_insert_with(|| ReceiveState::new(track_mutate_messages));
 
-                    let mut receive = receive_state.as_context();
+                    let mut receive = receive_state.as_context(client);
                     if let Some(acks) =
                         apply_replication(world, &mut receive, params, received_messages)
                     {
@@ -167,13 +166,30 @@ pub(crate) fn add_receive_context(
 
 pub(crate) fn remove_receive_context(
     remove: On<Remove, ConnectedClient>,
+    mut commands: Commands,
     contexts: Option<ResMut<ReceiveContexts>>,
+    remotes: Query<(Entity, &ReplicatedFrom), With<Remote>>,
 ) {
     let Some(mut contexts) = contexts else {
         return;
     };
 
-    contexts.remove(&remove.entity);
+    let Some(receive_state) = contexts.remove(&remove.entity) else {
+        return;
+    };
+    let spawned_entities = receive_state.into_spawned_entities();
+
+    for (entity, replicated_from) in &remotes {
+        if replicated_from.0 != remove.entity {
+            continue;
+        }
+
+        if spawned_entities.contains(&entity) {
+            commands.entity(entity).despawn();
+        } else {
+            commands.entity(entity).remove::<ReplicatedFrom>();
+        }
+    }
 }
 
 pub(crate) fn sync_receive_contexts(
@@ -522,6 +538,12 @@ fn apply_changes(
         EntityEntry::Vacant(entry) => {
             let mut client_entity = DeferredEntity::new(world.spawn_empty(), params.changes);
             client_entity.insert(Remote);
+            if let Some(source) = receive.source {
+                client_entity.insert(ReplicatedFrom(source));
+                if let Some(spawned_entities) = receive.spawned_entities.as_deref_mut() {
+                    spawned_entities.insert(client_entity.id());
+                }
+            }
             entry.insert(client_entity.id());
             client_entity
         }
