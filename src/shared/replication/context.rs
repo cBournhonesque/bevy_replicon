@@ -1,10 +1,12 @@
-use bevy::prelude::*;
+use bevy::{ecs::entity::EntityHashMap, prelude::*};
 use bytes::Bytes;
 
 use crate::{
     client::{ServerUpdateTick, server_mutate_ticks::ServerMutateTicks},
     prelude::*,
-    shared::server_entity_map::ServerEntityMap,
+    shared::{
+        replication::track_mutate_messages::TrackMutateMessages, server_entity_map::ServerEntityMap,
+    },
 };
 
 /// Explicit receive-side state for one upstream sender.
@@ -17,6 +19,42 @@ pub(crate) struct ReceiveContext<'a> {
     pub(crate) buffered_mutations: &'a mut BufferedMutations,
     pub(crate) mutate_ticks: Option<&'a mut ServerMutateTicks>,
 }
+
+/// Owned receive-side state for a single upstream sender.
+#[derive(Default)]
+pub(crate) struct ReceiveState {
+    entity_map: ServerEntityMap,
+    update_tick: ServerUpdateTick,
+    buffered_mutations: BufferedMutations,
+    mutate_ticks: Option<ServerMutateTicks>,
+}
+
+impl ReceiveState {
+    pub(crate) fn new(track_mutate_messages: TrackMutateMessages) -> Self {
+        Self {
+            mutate_ticks: (*track_mutate_messages).then(ServerMutateTicks::default),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn as_context(&mut self) -> ReceiveContext<'_> {
+        ReceiveContext {
+            entity_map: &mut self.entity_map,
+            update_tick: &mut self.update_tick,
+            buffered_mutations: &mut self.buffered_mutations,
+            mutate_ticks: self.mutate_ticks.as_mut(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutate_ticks(&self) -> Option<&ServerMutateTicks> {
+        self.mutate_ticks.as_ref()
+    }
+}
+
+/// Receive contexts keyed by the sending client entity on the server.
+#[derive(Resource, Default, Deref, DerefMut)]
+pub(crate) struct ReceiveContexts(pub(crate) EntityHashMap<ReceiveState>);
 
 /// Builds the current singleton receive context from world resources.
 pub(crate) fn with_receive_context<R>(

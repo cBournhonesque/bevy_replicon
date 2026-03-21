@@ -33,9 +33,15 @@ use crate::{
         visibility::registry::FilterRegistry,
     },
     shared::{
+        backend::channels::ClientToServerReplicationChannels,
         message::server_message::message_buffer::MessageBuffer,
         replication::{
             client_ticks::ClientTicks,
+            context::ReceiveContexts,
+            receive::{
+                add_receive_context, receive_replication_from_clients, remove_receive_context,
+                sync_receive_contexts,
+            },
             rules::ReplicationRules,
             send::{
                 DespawnBuffer, ServerChangeTick, buffer_despawn, buffer_removals,
@@ -129,12 +135,20 @@ impl Plugin for ServerPlugin {
             )
             .add_observer(handle_connect)
             .add_observer(handle_disconnect)
+            .add_observer(add_receive_context)
+            .add_observer(remove_receive_context)
             .add_observer(check_mutation_ticks)
             .add_observer(buffer_despawn)
             .add_systems(
                 PreUpdate,
                 (
+                    sync_receive_contexts
+                        .run_if(resource_exists::<ReceiveContexts>)
+                        .run_if(resource_exists::<ClientToServerReplicationChannels>),
                     receive_acks,
+                    receive_replication_from_clients
+                        .run_if(resource_exists::<ReceiveContexts>)
+                        .run_if(resource_exists::<ClientToServerReplicationChannels>),
                     cleanup_acks(self.mutations_timeout).run_if(on_timer(self.mutations_timeout)),
                 )
                     .chain()
