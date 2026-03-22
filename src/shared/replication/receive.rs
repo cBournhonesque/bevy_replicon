@@ -91,6 +91,8 @@ pub(crate) fn receive_replication(
     mut received_messages: Local<ReceivedReplicationMessages>,
 ) {
     world.resource_scope(|world, mut messages: Mut<ClientMessages>| {
+        // TODO: why are we draining into a separate vec? can we avoid doing this?
+        //  It's probably to avoid putting ClientMessages in the signature of apply_replication
         messages.drain_received_into(ServerChannel::Updates, &mut received_messages.updates);
         messages.drain_received_into(ServerChannel::Mutations, &mut received_messages.mutations);
 
@@ -757,6 +759,8 @@ fn apply_mutations(
     Ok(())
 }
 
+/// Apply a function `f` with all the necessary resources for receiving replication messages
+/// stored in the `ReceiveParams` argument.
 fn with_receive_params<R>(
     world: &mut World,
     changes: &mut DeferredChanges,
