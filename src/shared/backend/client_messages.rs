@@ -67,6 +67,32 @@ impl ClientMessages {
         channel_messages.drain(..)
     }
 
+    /// Drains all received messages from a channel into the provided buffer.
+    pub(crate) fn drain_received_into<I: Into<usize>>(
+        &mut self,
+        channel_id: I,
+        messages: &mut Vec<Bytes>,
+    ) {
+        let channel_id = channel_id.into();
+        let channel_messages = self
+            .received_messages
+            .get_mut(channel_id)
+            .unwrap_or_else(|| panic!("client should have a receive channel with id {channel_id}"));
+
+        if !channel_messages.is_empty() {
+            trace!(
+                "received {} message(s) totaling {} bytes from channel {channel_id}",
+                channel_messages.len(),
+                channel_messages
+                    .iter()
+                    .map(|bytes| bytes.len())
+                    .sum::<usize>()
+            );
+        }
+
+        messages.append(channel_messages);
+    }
+
     /// Sends a message to the server over a channel.
     ///
     /// <div class="warning">

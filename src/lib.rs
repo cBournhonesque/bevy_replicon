@@ -96,9 +96,12 @@ section.
 It's a process of exchanging data in order to keep the world in sync. Replicon
 provides a high-level API to automate server-authoritative replication.
 
-Replication happens only from server to clients. It's necessary to prevent cheating.
-If you need to send information from clients to the server, use
-[messages](#network-messages-and-events).
+By default replication happens only from server to clients. If you need
+client-authored replication, opt into it explicitly with
+[`ClientPlugin::with_send_to_server`] and
+[`ServerPlugin::with_receive_from_clients`]. For lightweight client-to-server
+communication, [messages](#network-messages-and-events) are still often a
+better fit.
 
 For implementation details see [`ServerChannel`](shared::backend::channels::ServerChannel).
 
@@ -709,7 +712,7 @@ pub mod prelude {
             },
             protocol::{ProtocolHash, ProtocolHasher, ProtocolMismatch},
             replication::{
-                Replicated,
+                RemoteEntity, Replicated, ReplicatedFrom,
                 receive_markers::AppMarkerExt,
                 registry::rule_fns::RuleFns,
                 rules::{AppRuleExt, component::ReplicationMode},

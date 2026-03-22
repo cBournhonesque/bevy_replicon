@@ -81,6 +81,42 @@ impl RepliconChannels {
     pub fn client_channels(&self) -> &[Channel] {
         &self.client
     }
+
+    /// Creates the internal channel family for client-to-server replication.
+    ///
+    pub(crate) fn create_client_to_server_replication_channels(
+        &mut self,
+    ) -> ClientToServerReplicationChannels {
+        ClientToServerReplicationChannels {
+            updates: self.create_client_channel(Channel::Ordered),
+            mutations: self.create_client_channel(Channel::Unreliable),
+            mutation_acks: self.create_server_channel(Channel::Ordered),
+        }
+    }
+}
+
+pub(crate) fn ensure_client_to_server_replication_channels(
+    world: &mut World,
+) -> ClientToServerReplicationChannels {
+    if let Some(channels) = world.get_resource::<ClientToServerReplicationChannels>() {
+        return *channels;
+    }
+
+    let channels = {
+        let mut replicon_channels = world.resource_mut::<RepliconChannels>();
+        replicon_channels.create_client_to_server_replication_channels()
+    };
+    world.insert_resource(channels);
+
+    channels
+}
+
+/// Internal reverse-direction replication channels for client-to-server replication.
+#[derive(Resource, Clone, Copy, Debug)]
+pub(crate) struct ClientToServerReplicationChannels {
+    pub(crate) updates: usize,
+    pub(crate) mutations: usize,
+    pub(crate) mutation_acks: usize,
 }
 
 /// Constant ID of a channel for sending data from server to client.

@@ -9,11 +9,13 @@ use bevy::{
     },
     platform::collections::hash_map::Entry,
     prelude::*,
+    time::common_conditions::on_timer,
 };
 use bytes::Buf;
 use log::{debug, trace, warn};
 
 use crate::{
+    client::ClientSystems,
     postcard_utils,
     prelude::*,
     server::{
@@ -32,7 +34,13 @@ use crate::{
         visibility::{client_visibility::ClientVisibility, registry::FilterRegistry},
     },
     shared::{
-        backend::channels::ClientChannel,
+        backend::{
+            channels::{
+                ClientChannel, ClientToServerReplicationChannels, ServerChannel,
+                ensure_client_to_server_replication_channels,
+            },
+            client_messages::ClientMessages,
+        },
         replication::{
             client_ticks::{ClientTicks, EntityTicks},
             registry::{ReplicationRegistry, component_mask::ComponentMask},
@@ -635,3 +643,193 @@ pub(crate) struct ServerChangeTick(pub(crate) Tick);
 /// not [`TickPolicy::EveryFrame`].
 #[derive(Resource, Deref, DerefMut, Default)]
 pub(crate) struct DespawnBuffer(pub(crate) Vec<Entity>);
+
+#[derive(Resource, Deref, DerefMut, Clone, Copy)]
+struct ClientSendMaxSize(usize);
+
+#[derive(Component)]
+struct ClientSendEndpoint;
+
+pub(crate) fn enable_send_to_server(app: &mut App, mutations_timeout: Duration, max_size: usize) {
+    let channels = ensure_client_to_server_replication_channels(app.world_mut());
+
+    app.init_resource::<DespawnBuffer>()
+        .init_resource::<RemovalBuffer>()
+        .init_resource::<SerializedData>()
+        .init_resource::<ServerMessages>()
+        .init_resource::<ServerTick>()
+        .init_resource::<ServerChangeTick>()
+        .init_resource::<ClientPools>()
+        .init_resource::<ReplicatedArchetypes>()
+        .init_resource::<RelatedEntities>()
+        .init_resource::<FilterRegistry>()
+        .insert_resource(ClientSendMaxSize(max_size))
+        .add_observer(check_mutation_ticks)
+        .add_observer(buffer_client_send_removals)
+        .add_observer(buffer_client_send_despawn)
+        .add_systems(OnEnter(ClientState::Connected), spawn_client_send_endpoint)
+        .add_systems(OnExit(ClientState::Connected), reset_client_send)
+        .add_systems(
+            PreUpdate,
+            (
+                receive_client_send_acks,
+                receive_acks,
+                cleanup_acks(mutations_timeout).run_if(on_timer(mutations_timeout)),
+            )
+                .chain()
+                .in_set(ClientSystems::Receive)
+                .run_if(in_state(ClientState::Connected)),
+        )
+        .add_systems(
+            PostUpdate,
+            (
+                increment_client_send_tick,
+                prepare_messages,
+                collect_mappings,
+                collect_despawns,
+                collect_removals,
+                collect_changes,
+                send_messages,
+                flush_client_send_messages,
+            )
+                .chain()
+                .in_set(ClientSystems::Send)
+                .run_if(in_state(ClientState::Connected)),
+        );
+
+    app.world_mut()
+        .resource_scope(|world, mut messages: Mut<ServerMessages>| {
+            let channels = world.resource::<RepliconChannels>();
+            messages.setup_client_channels(channels.client_channels().len());
+        });
+    app.world_mut().insert_resource(channels);
+}
+
+fn spawn_client_send_endpoint(
+    mut commands: Commands,
+    endpoints: Query<Entity, With<ClientSendEndpoint>>,
+    max_size: Res<ClientSendMaxSize>,
+) {
+    if endpoints.single().is_ok() {
+        return;
+    }
+
+    commands.spawn((
+        ClientSendEndpoint,
+        ConnectedClient {
+            max_size: **max_size,
+        },
+        AuthorizedClient,
+    ));
+}
+
+fn reset_client_send(
+    mut commands: Commands,
+    mut messages: ResMut<ServerMessages>,
+    mut server_tick: ResMut<ServerTick>,
+    mut change_tick: ResMut<ServerChangeTick>,
+    mut related_entities: ResMut<RelatedEntities>,
+    mut despawn_buffer: ResMut<DespawnBuffer>,
+    mut removal_buffer: ResMut<RemovalBuffer>,
+    endpoints: Query<Entity, With<ClientSendEndpoint>>,
+) {
+    messages.clear();
+    *server_tick = Default::default();
+    *change_tick = Default::default();
+    related_entities.clear();
+    despawn_buffer.clear();
+    removal_buffer.clear();
+    for endpoint in &endpoints {
+        commands.entity(endpoint).despawn();
+    }
+}
+
+fn increment_client_send_tick(mut server_tick: ResMut<ServerTick>) {
+    server_tick.increment();
+}
+
+fn receive_client_send_acks(
+    channels: Res<ClientToServerReplicationChannels>,
+    mut client_messages: ResMut<ClientMessages>,
+    mut server_messages: ResMut<ServerMessages>,
+    endpoint: Query<Entity, With<ClientSendEndpoint>>,
+) {
+    let Ok(endpoint) = endpoint.single() else {
+        return;
+    };
+
+    for message in client_messages.receive(channels.mutation_acks) {
+        server_messages.insert_received(endpoint, ClientChannel::MutationAcks, message);
+    }
+}
+
+fn flush_client_send_messages(
+    channels: Res<ClientToServerReplicationChannels>,
+    mut client_messages: ResMut<ClientMessages>,
+    mut server_messages: ResMut<ServerMessages>,
+    endpoint: Query<Entity, With<ClientSendEndpoint>>,
+) {
+    let Ok(endpoint) = endpoint.single() else {
+        return;
+    };
+
+    server_messages.retain_sent(|(client, channel_id, message)| {
+        if *client != endpoint {
+            return true;
+        }
+
+        let reverse_channel = match *channel_id {
+            id if id == usize::from(ServerChannel::Updates) => channels.updates,
+            id if id == usize::from(ServerChannel::Mutations) => channels.mutations,
+            other => panic!("unexpected client send channel {other}"),
+        };
+        client_messages.send(reverse_channel, message.clone());
+        false
+    });
+}
+
+fn buffer_client_send_removals(
+    remove: On<Remove>,
+    entities: &Entities,
+    archetypes: &Archetypes,
+    state: Res<State<ClientState>>,
+    mut replicated_archetypes: ResMut<ReplicatedArchetypes>,
+    rules: Res<ReplicationRules>,
+    registry: Option<Res<ReplicationRegistry>>,
+    mut removals: ResMut<RemovalBuffer>,
+) {
+    if *state != ClientState::Connected {
+        return;
+    }
+
+    let components = remove.trigger().components;
+    if components.contains(&replicated_archetypes.marker_id()) {
+        trace!("ignoring removals for despawned `{}`", remove.entity);
+        return;
+    }
+
+    let registry = registry.expect("registry should always exist on the sender");
+
+    replicated_archetypes.update(archetypes, &rules);
+    let location = entities.get_spawned(remove.entity).unwrap();
+    let Some(archetype) = replicated_archetypes.get(location.archetype_id) else {
+        trace!(
+            "ignoring `{components:?}` removal for non-replicated `{}`",
+            remove.entity
+        );
+        return;
+    };
+
+    removals.insert(remove.entity, components, archetype, &registry);
+}
+
+fn buffer_client_send_despawn(
+    remove: On<Remove, Replicated>,
+    mut despawn_buffer: ResMut<DespawnBuffer>,
+    state: Res<State<ClientState>>,
+) {
+    if *state == ClientState::Connected {
+        trace!("buffering despawn of `{}`", remove.entity);
+        despawn_buffer.push(remove.entity);
+    }
+}

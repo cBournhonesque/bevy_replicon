@@ -1,4 +1,4 @@
-use bevy::prelude::*;
+use bevy::{ecs::entity::EntityHashMap, prelude::*};
 use bytes::{Buf, Bytes};
 use log::{debug, error, trace};
 use postcard::experimental::max_size::MaxSize;
@@ -12,9 +12,18 @@ use crate::{
     postcard_utils,
     prelude::*,
     shared::{
-        backend::channels::{ClientChannel, ServerChannel},
+        backend::{
+            channels::{
+                ClientChannel, ClientToServerReplicationChannels, ServerChannel,
+                ensure_client_to_server_replication_channels,
+            },
+            server_messages::ServerMessages,
+        },
         replication::{
-            context::{BufferedMutate, ReceiveContext, with_receive_context},
+            RemoteEntity, ReplicatedFrom,
+            context::{
+                BufferedMutate, ReceiveContext, ReceiveContexts, ReceiveState, with_receive_context,
+            },
             deferred_entity::{DeferredChanges, DeferredEntity},
             mutate_index::MutateIndex,
             receive_markers::{EntityMarkers, ReceiveMarkers},
@@ -23,11 +32,41 @@ use crate::{
                 ctx::{DespawnCtx, EntitySpawner, RemoveCtx, WriteCtx},
             },
             signature::SignatureMap,
+            track_mutate_messages::TrackMutateMessages,
             update_message_flags::UpdateMessageFlags,
         },
         server_entity_map::{EntityEntry, ServerEntityMap},
     },
 };
+
+/// Enables internal server-side receiving for client-to-server replication.
+///
+/// This is intentionally crate-private until the public opt-in API lands.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn enable_receive_from_clients(app: &mut App) -> ClientToServerReplicationChannels {
+    let channels = ensure_client_to_server_replication_channels(app.world_mut());
+    app.world_mut().init_resource::<ReceiveContexts>();
+    app.world_mut()
+        .resource_scope(|world, mut messages: Mut<ServerMessages>| {
+            let channels = world.resource::<RepliconChannels>();
+            messages.setup_client_channels(channels.client_channels().len());
+        });
+
+    let track_mutate_messages = *app.world().resource::<TrackMutateMessages>();
+    let existing_clients = app
+        .world_mut()
+        .query_filtered::<Entity, With<ConnectedClient>>()
+        .iter(app.world())
+        .collect::<Vec<_>>();
+    let mut contexts = app.world_mut().resource_mut::<ReceiveContexts>();
+    for client in existing_clients {
+        contexts
+            .entry(client)
+            .or_insert_with(|| ReceiveState::new(track_mutate_messages));
+    }
+
+    channels
+}
 
 /// Receives and applies replication messages from the server.
 ///
@@ -49,39 +88,124 @@ pub(crate) fn receive_replication(
     world: &mut World,
     mut changes: Local<DeferredChanges>,
     mut entity_markers: Local<EntityMarkers>,
+    mut received_messages: Local<ReceivedReplicationMessages>,
 ) {
     world.resource_scope(|world, mut messages: Mut<ClientMessages>| {
-        world.resource_scope(|world, mut signature_map: Mut<SignatureMap>| {
-            world.resource_scope(|world, receive_markers: Mut<ReceiveMarkers>| {
-                world.resource_scope(|world, registry: Mut<ReplicationRegistry>| {
-                    world.resource_scope(
-                        |world, mut replicated: Mut<Messages<EntityReplicated>>| {
-                            let type_registry = world.resource::<AppTypeRegistry>().clone();
-                            let mut stats = world.remove_resource::<ClientReplicationStats>();
-                            let mut params = ReceiveParams {
-                                changes: &mut changes,
-                                entity_markers: &mut entity_markers,
-                                signature_map: &mut signature_map,
-                                replicated: &mut replicated,
-                                stats: stats.as_mut(),
-                                receive_markers: &receive_markers,
-                                registry: &registry,
-                                type_registry: &type_registry,
-                            };
+        // TODO: why are we draining into a separate vec? can we avoid doing this?
+        //  It's probably to avoid putting ClientMessages in the signature of apply_replication
+        messages.drain_received_into(ServerChannel::Updates, &mut received_messages.updates);
+        messages.drain_received_into(ServerChannel::Mutations, &mut received_messages.mutations);
 
-                            with_receive_context(world, |world, receive| {
-                                apply_replication(world, receive, &mut params, &mut messages);
-                            });
-
-                            if let Some(stats) = stats {
-                                world.insert_resource(stats);
-                            }
-                        },
-                    )
-                })
-            })
-        })
+        with_receive_params(world, &mut changes, &mut entity_markers, |world, params| {
+            with_receive_context(world, |world, receive| {
+                if let Some(acks) =
+                    apply_replication(world, receive, params, &mut received_messages)
+                {
+                    messages.send(ClientChannel::MutationAcks, acks);
+                }
+            });
+        });
     })
+}
+
+/// Receives and applies replication messages from multiple clients into per-client receive contexts.
+pub(crate) fn receive_replication_from_clients(
+    world: &mut World,
+    mut changes: Local<DeferredChanges>,
+    mut entity_markers: Local<EntityMarkers>,
+    mut peer_messages: Local<PeerReceivedMessages>,
+) {
+    let Some(channels) = world
+        .get_resource::<ClientToServerReplicationChannels>()
+        .copied()
+    else {
+        return;
+    };
+    let track_mutate_messages = *world.resource::<TrackMutateMessages>();
+
+    world.resource_scope(|world, mut messages: Mut<ServerMessages>| {
+        messages.drain_received_into(channels.updates, &mut peer_messages.updates);
+        messages.drain_received_into(channels.mutations, &mut peer_messages.mutations);
+        peer_messages.prepare();
+        if peer_messages.is_empty() {
+            return;
+        }
+
+        with_receive_params(world, &mut changes, &mut entity_markers, |world, params| {
+            world.resource_scope(|world, mut contexts: Mut<ReceiveContexts>| {
+                for (client, received_messages) in peer_messages.iter_mut() {
+                    let receive_state = contexts
+                        .entry(client)
+                        .or_insert_with(|| ReceiveState::new(track_mutate_messages));
+
+                    let mut receive = receive_state.as_context(client);
+                    if let Some(acks) =
+                        apply_replication(world, &mut receive, params, received_messages)
+                    {
+                        messages.send(client, channels.mutation_acks, acks);
+                    }
+
+                    received_messages.clear();
+                }
+
+                peer_messages.retain(|client| contexts.contains_key(&client));
+            });
+        });
+    });
+}
+
+pub(crate) fn add_receive_context(
+    add: On<Add, ConnectedClient>,
+    contexts: Option<ResMut<ReceiveContexts>>,
+    track_mutate_messages: Res<TrackMutateMessages>,
+) {
+    let Some(mut contexts) = contexts else {
+        return;
+    };
+
+    contexts.insert(add.entity, ReceiveState::new(*track_mutate_messages));
+}
+
+pub(crate) fn remove_receive_context(
+    remove: On<Remove, ConnectedClient>,
+    mut commands: Commands,
+    contexts: Option<ResMut<ReceiveContexts>>,
+    remotes: Query<(Entity, &ReplicatedFrom), With<Remote>>,
+) {
+    let Some(mut contexts) = contexts else {
+        return;
+    };
+
+    let Some(receive_state) = contexts.remove(&remove.entity) else {
+        return;
+    };
+    let spawned_entities = receive_state.into_spawned_entities();
+
+    for (entity, replicated_from) in &remotes {
+        if replicated_from.0 != remove.entity {
+            continue;
+        }
+
+        if spawned_entities.contains(&entity) {
+            commands.entity(entity).despawn();
+        } else {
+            commands.entity(entity).remove::<ReplicatedFrom>();
+        }
+    }
+}
+
+pub(crate) fn sync_receive_contexts(
+    mut contexts: ResMut<ReceiveContexts>,
+    clients: Query<Entity, With<ConnectedClient>>,
+    track_mutate_messages: Res<TrackMutateMessages>,
+) {
+    for client in &clients {
+        contexts
+            .entry(client)
+            .or_insert_with(|| ReceiveState::new(*track_mutate_messages));
+    }
+
+    contexts.retain(|client, _| clients.get(*client).is_ok());
 }
 
 /// Reads all received messages and applies them.
@@ -91,9 +215,9 @@ fn apply_replication(
     world: &mut World,
     receive: &mut ReceiveContext,
     params: &mut ReceiveParams,
-    messages: &mut ClientMessages,
-) {
-    for mut message in messages.receive(ServerChannel::Updates) {
+    messages: &mut ReceivedReplicationMessages,
+) -> Option<Vec<u8>> {
+    for mut message in messages.updates.drain(..) {
         if let Err(e) = apply_update_message(world, receive, params, &mut message) {
             error!("unable to apply update message: {e}");
         }
@@ -105,19 +229,20 @@ fn apply_replication(
     // but skip outdated data per-entity by checking last received tick for it
     // (unless user requested history via marker).
     let update_tick = *receive.update_tick;
-    let acks_size =
-        MutateIndex::POSTCARD_MAX_SIZE * messages.received_count(ServerChannel::Mutations);
-    if acks_size != 0 {
+    if !messages.mutations.is_empty() {
+        let acks_size = MutateIndex::POSTCARD_MAX_SIZE * messages.mutations.len();
         let mut acks = Vec::with_capacity(acks_size);
-        for message in messages.receive(ServerChannel::Mutations) {
+        for message in messages.mutations.drain(..) {
             if let Err(e) = buffer_mutate_message(receive, params, message, &mut acks) {
                 error!("unable to buffer mutate message: {e}");
             }
         }
-        messages.send(ClientChannel::MutationAcks, acks);
+        apply_mutate_messages(world, receive, params, update_tick);
+        Some(acks)
+    } else {
+        apply_mutate_messages(world, receive, params, update_tick);
+        None
     }
-
-    apply_mutate_messages(world, receive, params, update_tick);
 }
 
 /// Reads and applies an update message.
@@ -218,7 +343,7 @@ fn buffer_mutate_message(
         1
     };
     let mutate_index: MutateIndex = postcard_utils::from_buf(&mut message)?;
-    trace!("received mutate message for {message_tick:?}");
+    trace!("received mutate message for {message_tick:?} requiring update tick {update_tick:?}");
     receive.buffered_mutations.insert(BufferedMutate {
         update_tick,
         message_tick,
@@ -243,7 +368,6 @@ fn apply_mutate_messages(
 ) {
     let entity_map = &mut *receive.entity_map;
     let mutate_ticks = &mut receive.mutate_ticks;
-
     receive.buffered_mutations.0.retain_mut(|mutate| {
         if mutate.update_tick > *update_tick {
             return true;
@@ -268,8 +392,9 @@ fn apply_mutate_messages(
 
         if let Some(mutate_ticks) = mutate_ticks.as_deref_mut()
             && mutate_ticks.confirm(mutate.message_tick, mutate.messages_count)
+            && let Some(mutate_tick_received) = params.mutate_tick_received.as_deref_mut()
         {
-            world.write_message(MutateTickReceived {
+            mutate_tick_received.write(MutateTickReceived {
                 tick: mutate.message_tick,
             });
         }
@@ -298,7 +423,9 @@ fn apply_entity_mapping(
 
     debug!("mapping `{server_entity}` to `{client_entity}` using hash 0x{hash:016x}");
     receive.entity_map.insert(server_entity, client_entity);
-    world.entity_mut(client_entity).insert(Remote);
+    world
+        .entity_mut(client_entity)
+        .insert((Remote, RemoteEntity(server_entity)));
 
     Ok(())
 }
@@ -354,7 +481,11 @@ fn apply_removals(
         .entity_markers
         .read(params.receive_markers, &*client_entity);
 
-    confirm_tick(&mut client_entity, params.replicated, message_tick);
+    confirm_tick(
+        &mut client_entity,
+        params.replicated.as_deref_mut(),
+        message_tick,
+    );
 
     let mut data = message.split_to(data_size);
     let len = apply_array(ArrayKind::Dynamic, &mut data, |data| {
@@ -406,11 +537,20 @@ fn apply_changes(
                 return Ok(());
             };
 
-            DeferredEntity::new(client_entity, params.changes)
+            let mut client_entity = DeferredEntity::new(client_entity, params.changes);
+            client_entity.insert(RemoteEntity(server_entity));
+            client_entity
         }
         EntityEntry::Vacant(entry) => {
             let mut client_entity = DeferredEntity::new(world.spawn_empty(), params.changes);
             client_entity.insert(Remote);
+            client_entity.insert(RemoteEntity(server_entity));
+            if let Some(source) = receive.source {
+                client_entity.insert(ReplicatedFrom(source));
+                if let Some(spawned_entities) = receive.spawned_entities.as_deref_mut() {
+                    spawned_entities.insert(client_entity.id());
+                }
+            }
             entry.insert(client_entity.id());
             client_entity
         }
@@ -420,7 +560,11 @@ fn apply_changes(
         .entity_markers
         .read(params.receive_markers, &*client_entity);
 
-    confirm_tick(&mut client_entity, params.replicated, message_tick);
+    confirm_tick(
+        &mut client_entity,
+        params.replicated.as_deref_mut(),
+        message_tick,
+    );
 
     let mut data = message.split_to(data_size);
     let len = apply_array(ArrayKind::Dynamic, &mut data, |data| {
@@ -487,7 +631,7 @@ enum ArrayKind {
 
 fn confirm_tick(
     entity: &mut DeferredEntity,
-    replicated: &mut Messages<EntityReplicated>,
+    replicated: Option<&mut Messages<EntityReplicated>>,
     tick: RepliconTick,
 ) {
     if let Some(mut history) = entity.get_mut::<ConfirmHistory>() {
@@ -495,10 +639,12 @@ fn confirm_tick(
     } else {
         entity.insert(ConfirmHistory::new(tick));
     }
-    replicated.write(EntityReplicated {
-        entity: entity.id(),
-        tick,
-    });
+    if let Some(replicated) = replicated {
+        replicated.write(EntityReplicated {
+            entity: entity.id(),
+            tick,
+        });
+    }
 }
 
 /// Deserializes and applies component mutations for an entity.
@@ -565,10 +711,12 @@ fn apply_mutations(
 
         history.set(ago);
     }
-    params.replicated.write(EntityReplicated {
-        entity: client_entity.id(),
-        tick: message_tick,
-    });
+    if let Some(replicated) = params.replicated.as_deref_mut() {
+        replicated.write(EntityReplicated {
+            entity: client_entity.id(),
+            tick: message_tick,
+        });
+    }
 
     let mut data = message.split_to(data_size);
     let len = apply_array(ArrayKind::Dynamic, &mut data, |data| {
@@ -611,6 +759,114 @@ fn apply_mutations(
     Ok(())
 }
 
+/// Apply a function `f` with all the necessary resources for receiving replication messages
+/// stored in the `ReceiveParams` argument.
+fn with_receive_params<R>(
+    world: &mut World,
+    changes: &mut DeferredChanges,
+    entity_markers: &mut EntityMarkers,
+    f: impl FnOnce(&mut World, &mut ReceiveParams) -> R,
+) -> R {
+    world.resource_scope(|world, mut signature_map: Mut<SignatureMap>| {
+        world.resource_scope(|world, receive_markers: Mut<ReceiveMarkers>| {
+            world.resource_scope(|world, registry: Mut<ReplicationRegistry>| {
+                let type_registry = world.resource::<AppTypeRegistry>().clone();
+                let mut stats = world.remove_resource::<ClientReplicationStats>();
+                let mut replicated = world.remove_resource::<Messages<EntityReplicated>>();
+                let mut mutate_tick_received =
+                    world.remove_resource::<Messages<MutateTickReceived>>();
+
+                let mut params = ReceiveParams {
+                    changes,
+                    entity_markers,
+                    signature_map: &mut signature_map,
+                    replicated: replicated.as_mut(),
+                    mutate_tick_received: mutate_tick_received.as_mut(),
+                    stats: stats.as_mut(),
+                    receive_markers: &receive_markers,
+                    registry: &registry,
+                    type_registry: &type_registry,
+                };
+                let result = f(world, &mut params);
+
+                if let Some(stats) = stats {
+                    world.insert_resource(stats);
+                }
+                if let Some(replicated) = replicated {
+                    world.insert_resource(replicated);
+                }
+                if let Some(mutate_tick_received) = mutate_tick_received {
+                    world.insert_resource(mutate_tick_received);
+                }
+
+                result
+            })
+        })
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct ReceivedReplicationMessages {
+    updates: Vec<Bytes>,
+    mutations: Vec<Bytes>,
+}
+
+impl ReceivedReplicationMessages {
+    fn clear(&mut self) {
+        self.updates.clear();
+        self.mutations.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.updates.is_empty() && self.mutations.is_empty()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PeerReceivedMessages {
+    updates: Vec<(Entity, Bytes)>,
+    mutations: Vec<(Entity, Bytes)>,
+    peers: EntityHashMap<ReceivedReplicationMessages>,
+}
+
+impl PeerReceivedMessages {
+    fn is_empty(&self) -> bool {
+        self.updates.is_empty()
+            && self.mutations.is_empty()
+            && self
+                .peers
+                .values()
+                .all(ReceivedReplicationMessages::is_empty)
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut ReceivedReplicationMessages)> {
+        self.peers
+            .iter_mut()
+            .map(|(&entity, messages)| (entity, messages))
+    }
+
+    fn retain(&mut self, mut f: impl FnMut(Entity) -> bool) {
+        self.peers.retain(|entity, _| f(*entity));
+    }
+
+    fn prepare(&mut self) {
+        for messages in self.peers.values_mut() {
+            messages.clear();
+        }
+
+        for (client, message) in self.updates.drain(..) {
+            self.peers.entry(client).or_default().updates.push(message);
+        }
+        for (client, message) in self.mutations.drain(..) {
+            self.peers
+                .entry(client)
+                .or_default()
+                .mutations
+                .push(message);
+        }
+    }
+}
+
 /// Borrowed resources from the world and locals.
 ///
 /// To avoid passing a lot of arguments into all receive functions.
@@ -618,9 +874,301 @@ struct ReceiveParams<'a> {
     changes: &'a mut DeferredChanges,
     entity_markers: &'a mut EntityMarkers,
     signature_map: &'a mut SignatureMap,
-    replicated: &'a mut Messages<EntityReplicated>,
+    replicated: Option<&'a mut Messages<EntityReplicated>>,
+    mutate_tick_received: Option<&'a mut Messages<MutateTickReceived>>,
     stats: Option<&'a mut ClientReplicationStats>,
     receive_markers: &'a ReceiveMarkers,
     registry: &'a ReplicationRegistry,
     type_registry: &'a AppTypeRegistry,
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::state::app::StatesPlugin;
+    use serde::{Deserialize, Serialize};
+    use test_log::test;
+
+    use super::*;
+    use crate::{
+        server::server_tick::ServerTick, shared::replication::track_mutate_messages::TrackAppExt,
+    };
+
+    #[test]
+    fn two_senders_distinct_entities() {
+        let (mut receiver, channels) = create_receiver(false);
+        let mut sender_a = create_sender(false);
+        let mut sender_b = create_sender(false);
+
+        let [connection_a, connection_b] =
+            connect_senders(&mut receiver, [&mut sender_a, &mut sender_b]);
+
+        let entity_a = sender_a.world_mut().spawn((Replicated, Marker(1))).id();
+        let entity_b = sender_b.world_mut().spawn((Replicated, Marker(2))).id();
+        assert_eq!(
+            entity_a, entity_b,
+            "both senders should use the same raw entity ID to exercise map collisions"
+        );
+
+        sender_a.update();
+        sender_b.update();
+        exchange_sender_messages(&mut sender_a, &mut receiver, &connection_a, channels);
+        exchange_sender_messages(&mut sender_b, &mut receiver, &connection_b, channels);
+        receiver.update();
+        exchange_receiver_acks(&mut receiver, &mut sender_a, &connection_a, channels);
+        exchange_receiver_acks(&mut receiver, &mut sender_b, &connection_b, channels);
+        sender_a.update();
+        sender_b.update();
+
+        let mut remotes = receiver
+            .world_mut()
+            .query_filtered::<&Marker, (With<Remote>, Without<Replicated>)>();
+        let mut values = remotes
+            .iter(receiver.world())
+            .map(|marker| marker.0)
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[test]
+    fn two_senders_same_tick_mutations() {
+        let (mut receiver, channels) = create_receiver(true);
+        let mut sender_a = create_sender(true);
+        let mut sender_b = create_sender(true);
+
+        let [connection_a, connection_b] =
+            connect_senders(&mut receiver, [&mut sender_a, &mut sender_b]);
+
+        let entity_a = sender_a
+            .world_mut()
+            .spawn((Replicated, BoolComponent(false)))
+            .id();
+        let entity_b = sender_b
+            .world_mut()
+            .spawn((Replicated, BoolComponent(false)))
+            .id();
+        assert_eq!(
+            entity_a, entity_b,
+            "both senders should use the same raw entity ID to exercise map collisions"
+        );
+
+        sender_a.update();
+        sender_b.update();
+        exchange_sender_messages(&mut sender_a, &mut receiver, &connection_a, channels);
+        exchange_sender_messages(&mut sender_b, &mut receiver, &connection_b, channels);
+        receiver.update();
+        exchange_receiver_acks(&mut receiver, &mut sender_a, &connection_a, channels);
+        exchange_receiver_acks(&mut receiver, &mut sender_b, &connection_b, channels);
+        sender_a.update();
+        sender_b.update();
+
+        sender_a
+            .world_mut()
+            .get_mut::<BoolComponent>(entity_a)
+            .unwrap()
+            .0 = true;
+        sender_b
+            .world_mut()
+            .get_mut::<BoolComponent>(entity_b)
+            .unwrap()
+            .0 = true;
+
+        sender_a.update();
+        sender_b.update();
+        let tick_a = **sender_a.world().resource::<ServerTick>();
+        let tick_b = **sender_b.world().resource::<ServerTick>();
+        assert_eq!(tick_a, tick_b, "mutation ticks should align across senders");
+
+        exchange_sender_messages(&mut sender_a, &mut receiver, &connection_a, channels);
+        exchange_sender_messages(&mut sender_b, &mut receiver, &connection_b, channels);
+        receiver.update();
+        exchange_receiver_acks(&mut receiver, &mut sender_a, &connection_a, channels);
+        exchange_receiver_acks(&mut receiver, &mut sender_b, &connection_b, channels);
+        sender_a.update();
+        sender_b.update();
+
+        let mut remotes = receiver
+            .world_mut()
+            .query_filtered::<&BoolComponent, (With<Remote>, Without<Replicated>)>();
+        assert_eq!(
+            remotes
+                .iter(receiver.world())
+                .filter(|component| component.0)
+                .count(),
+            2
+        );
+
+        let contexts = receiver.world().resource::<ReceiveContexts>();
+        assert_eq!(contexts.len(), 2);
+        for receive_state in contexts.values() {
+            let mutate_ticks = receive_state
+                .mutate_ticks()
+                .expect("mutate tracking should be enabled per sender");
+            assert!(
+                mutate_ticks.contains(tick_a),
+                "each sender should track its own mutation confirmations"
+            );
+        }
+    }
+
+    fn create_receiver(track_mutate_messages: bool) -> (App, ClientToServerReplicationChannels) {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            StatesPlugin,
+            RepliconSharedPlugin {
+                auth_method: AuthMethod::None,
+            },
+            ServerPlugin::new(PostUpdate),
+            ServerMessagePlugin,
+        ))
+        .replicate::<Marker>()
+        .replicate::<BoolComponent>();
+        if track_mutate_messages {
+            app.track_mutate_messages();
+        }
+        app.finish();
+
+        let channels = enable_receive_from_clients(&mut app);
+
+        (app, channels)
+    }
+
+    fn create_sender(track_mutate_messages: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            StatesPlugin,
+            RepliconSharedPlugin {
+                auth_method: AuthMethod::None,
+            },
+            ServerPlugin::new(PostUpdate),
+            ServerMessagePlugin,
+        ))
+        .replicate::<Marker>()
+        .replicate::<BoolComponent>();
+        if track_mutate_messages {
+            app.track_mutate_messages();
+        }
+        app.finish();
+
+        app
+    }
+
+    fn connect_senders<const N: usize>(
+        receiver: &mut App,
+        mut senders: [&mut App; N],
+    ) -> [SenderConnection; N] {
+        receiver
+            .world_mut()
+            .resource_mut::<NextState<ServerState>>()
+            .set(ServerState::Running);
+        for sender in &mut senders {
+            sender
+                .world_mut()
+                .resource_mut::<NextState<ServerState>>()
+                .set(ServerState::Running);
+        }
+
+        let connections = core::array::from_fn(|index| {
+            let receiver_on_sender = senders[index]
+                .world_mut()
+                .spawn(ConnectedClient { max_size: 1200 })
+                .id();
+            let sender_on_receiver = receiver
+                .world_mut()
+                .spawn(ConnectedClient { max_size: 1200 })
+                .id();
+
+            SenderConnection {
+                receiver_on_sender,
+                sender_on_receiver,
+            }
+        });
+
+        for sender in &mut senders {
+            sender.update();
+        }
+        receiver.update();
+        for sender in &mut senders {
+            sender.update();
+        }
+        receiver.update();
+
+        for sender in &mut senders {
+            sender.world_mut().resource_mut::<ServerMessages>().clear();
+        }
+        receiver
+            .world_mut()
+            .resource_mut::<ServerMessages>()
+            .clear();
+
+        connections
+    }
+
+    fn exchange_sender_messages(
+        sender: &mut App,
+        receiver: &mut App,
+        connection: &SenderConnection,
+        channels: ClientToServerReplicationChannels,
+    ) {
+        let messages = sender
+            .world_mut()
+            .resource_mut::<ServerMessages>()
+            .drain_sent()
+            .collect::<Vec<_>>();
+        let mut receiver_messages = receiver.world_mut().resource_mut::<ServerMessages>();
+
+        for (client, channel_id, message) in messages {
+            assert_eq!(client, connection.receiver_on_sender);
+            let reverse_channel = match channel_id {
+                id if id == usize::from(ServerChannel::Updates) => channels.updates,
+                id if id == usize::from(ServerChannel::Mutations) => channels.mutations,
+                other => panic!("unexpected sender channel {other}"),
+            };
+            receiver_messages.insert_received(
+                connection.sender_on_receiver,
+                reverse_channel,
+                message,
+            );
+        }
+    }
+
+    fn exchange_receiver_acks(
+        receiver: &mut App,
+        sender: &mut App,
+        connection: &SenderConnection,
+        channels: ClientToServerReplicationChannels,
+    ) {
+        let mut sender_messages = sender.world_mut().resource_mut::<ServerMessages>();
+        receiver
+            .world_mut()
+            .resource_mut::<ServerMessages>()
+            .retain_sent(|(client, channel_id, message)| {
+                if *client == connection.sender_on_receiver {
+                    if *channel_id == channels.mutation_acks {
+                        sender_messages.insert_received(
+                            connection.receiver_on_sender,
+                            ClientChannel::MutationAcks,
+                            message.clone(),
+                        );
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+    }
+
+    #[derive(Component, Deserialize, Serialize)]
+    struct Marker(u8);
+
+    #[derive(Component, Deserialize, Serialize)]
+    struct BoolComponent(bool);
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct SenderConnection {
+        receiver_on_sender: Entity,
+        sender_on_receiver: Entity,
+    }
 }
