@@ -20,7 +20,7 @@ use crate::{
             server_messages::ServerMessages,
         },
         replication::{
-            ReplicatedFrom,
+            RemoteEntity, ReplicatedFrom,
             context::{
                 BufferedMutate, ReceiveContext, ReceiveContexts, ReceiveState, with_receive_context,
             },
@@ -421,7 +421,9 @@ fn apply_entity_mapping(
 
     debug!("mapping `{server_entity}` to `{client_entity}` using hash 0x{hash:016x}");
     receive.entity_map.insert(server_entity, client_entity);
-    world.entity_mut(client_entity).insert(Remote);
+    world
+        .entity_mut(client_entity)
+        .insert((Remote, RemoteEntity(server_entity)));
 
     Ok(())
 }
@@ -533,11 +535,14 @@ fn apply_changes(
                 return Ok(());
             };
 
-            DeferredEntity::new(client_entity, params.changes)
+            let mut client_entity = DeferredEntity::new(client_entity, params.changes);
+            client_entity.insert(RemoteEntity(server_entity));
+            client_entity
         }
         EntityEntry::Vacant(entry) => {
             let mut client_entity = DeferredEntity::new(world.spawn_empty(), params.changes);
             client_entity.insert(Remote);
+            client_entity.insert(RemoteEntity(server_entity));
             if let Some(source) = receive.source {
                 client_entity.insert(ReplicatedFrom(source));
                 if let Some(spawned_entities) = receive.spawned_entities.as_deref_mut() {

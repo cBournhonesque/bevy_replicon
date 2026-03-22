@@ -31,3 +31,12 @@ pub struct Replicated;
 #[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
 #[reflect(Component)]
 pub struct ReplicatedFrom(pub Entity);
+
+/// The remote-world entity id that a received [`Remote`](crate::prelude::Remote)
+/// entity corresponds to.
+///
+/// Inserted on receive-side entities for both ordinary server-to-client
+/// replication and opt-in client-to-server replication.
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Component)]
+pub struct RemoteEntity(pub Entity);

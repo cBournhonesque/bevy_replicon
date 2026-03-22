@@ -717,7 +717,7 @@ pub mod prelude {
             },
             protocol::{ProtocolHash, ProtocolHasher, ProtocolMismatch},
             replication::{
-                Replicated, ReplicatedFrom,
+                RemoteEntity, Replicated, ReplicatedFrom,
                 receive_markers::AppMarkerExt,
                 registry::rule_fns::RuleFns,
                 rules::{AppRuleExt, component::ReplicationMode},
