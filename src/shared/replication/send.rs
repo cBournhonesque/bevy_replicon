@@ -19,7 +19,7 @@ use crate::{
     postcard_utils,
     prelude::*,
     server::{
-        PriorityMap,
+        PriorityMap, ServerSystems,
         client_pools::ClientPools,
         related_entities::RelatedEntities,
         removal_buffer::RemovalBuffer,
@@ -645,14 +645,125 @@ pub(crate) struct ServerChangeTick(pub(crate) Tick);
 pub(crate) struct DespawnBuffer(pub(crate) Vec<Entity>);
 
 #[derive(Resource, Deref, DerefMut, Clone, Copy)]
-struct ClientSendMaxSize(usize);
+struct SinglePeerSendMaxSize(usize);
 
 #[derive(Component)]
-struct ClientSendEndpoint;
+struct SinglePeerSendEndpoint;
 
-pub(crate) fn enable_send_to_server(app: &mut App, mutations_timeout: Duration, max_size: usize) {
-    let channels = ensure_client_to_server_replication_channels(app.world_mut());
+pub(crate) struct SinglePeerSendPlugin {
+    pub(crate) mutations_timeout: Duration,
+    pub(crate) max_size: usize,
+}
 
+impl Plugin for SinglePeerSendPlugin {
+    fn build(&self, app: &mut App) {
+        let channels = ensure_client_to_server_replication_channels(app.world_mut());
+
+        init_send_resources(app);
+        app.insert_resource(SinglePeerSendMaxSize(self.max_size))
+            .add_observer(check_mutation_ticks)
+            .add_observer(buffer_single_peer_send_removals)
+            .add_observer(buffer_single_peer_send_despawn)
+            .add_systems(
+                OnEnter(ClientState::Connected),
+                spawn_single_peer_send_endpoint,
+            )
+            .add_systems(OnExit(ClientState::Connected), reset_single_peer_send)
+            .add_systems(
+                PreUpdate,
+                (
+                    receive_single_peer_send_acks,
+                    receive_acks,
+                    cleanup_acks(self.mutations_timeout).run_if(on_timer(self.mutations_timeout)),
+                )
+                    .chain()
+                    .in_set(ClientSystems::Receive)
+                    .run_if(in_state(ClientState::Connected)),
+            )
+            .add_systems(
+                PostUpdate,
+                (
+                    increment_single_peer_send_tick,
+                    prepare_messages,
+                    collect_mappings,
+                    collect_despawns,
+                    collect_removals,
+                    collect_changes,
+                    send_messages,
+                    flush_single_peer_send_messages,
+                )
+                    .chain()
+                    .in_set(ClientSystems::Send)
+                    .run_if(in_state(ClientState::Connected)),
+            );
+
+        app.world_mut()
+            .resource_scope(|world, mut messages: Mut<ServerMessages>| {
+                let channels = world.resource::<RepliconChannels>();
+                messages.setup_client_channels(channels.client_channels().len());
+            });
+        app.world_mut().insert_resource(channels);
+    }
+}
+
+pub(crate) struct MultiPeerSendPlugin {
+    pub(crate) mutations_timeout: Duration,
+}
+
+impl Plugin for MultiPeerSendPlugin {
+    fn build(&self, app: &mut App) {
+        init_send_resources(app);
+        app.add_observer(check_mutation_ticks)
+            .add_observer(buffer_despawn)
+            .add_systems(
+                PreUpdate,
+                (
+                    receive_acks,
+                    cleanup_acks(self.mutations_timeout).run_if(on_timer(self.mutations_timeout)),
+                )
+                    .chain()
+                    .in_set(ServerSystems::Receive)
+                    .run_if(in_state(ServerState::Running)),
+            )
+            .add_systems(
+                PostUpdate,
+                (
+                    prepare_messages,
+                    collect_mappings,
+                    collect_despawns,
+                    collect_removals,
+                    collect_changes,
+                    send_messages,
+                )
+                    .chain()
+                    .run_if(resource_changed::<ServerTick>)
+                    .in_set(ServerSystems::Send)
+                    .run_if(in_state(ServerState::Running)),
+            );
+    }
+
+    fn finish(&self, app: &mut App) {
+        // Multiple rules can include components with the same ID,
+        // we collect them here to deduplicate.
+        let rules = app.world().resource::<ReplicationRules>();
+        let replicated_ids = rules
+            .iter()
+            .flat_map(|rule| &rule.components)
+            .map(|component| component.id)
+            .collect::<bevy::platform::collections::HashSet<_>>();
+
+        // Removal observer without any components will trigger on any removal.
+        if !replicated_ids.is_empty() {
+            let mut remove_observer = Observer::new(buffer_removals);
+            for id in replicated_ids {
+                remove_observer = remove_observer.with_component(id);
+            }
+            app.world_mut().spawn(remove_observer);
+        }
+    }
+}
+
+fn init_send_resources(app: &mut App) {
     app.init_resource::<DespawnBuffer>()
         .init_resource::<RemovalBuffer>()
         .init_resource::<SerializedData>()
@@ -662,60 +773,20 @@ pub(crate) fn enable_send_to_server(app: &mut App, mutations_timeout: Duration, 
         .init_resource::<ClientPools>()
         .init_resource::<ReplicatedArchetypes>()
         .init_resource::<RelatedEntities>()
-        .init_resource::<FilterRegistry>()
-        .insert_resource(ClientSendMaxSize(max_size))
-        .add_observer(check_mutation_ticks)
-        .add_observer(buffer_client_send_removals)
-        .add_observer(buffer_client_send_despawn)
-        .add_systems(OnEnter(ClientState::Connected), spawn_client_send_endpoint)
-        .add_systems(OnExit(ClientState::Connected), reset_client_send)
-        .add_systems(
-            PreUpdate,
-            (
-                receive_client_send_acks,
-                receive_acks,
-                cleanup_acks(mutations_timeout).run_if(on_timer(mutations_timeout)),
-            )
-                .chain()
-                .in_set(ClientSystems::Receive)
-                .run_if(in_state(ClientState::Connected)),
-        )
-        .add_systems(
-            PostUpdate,
-            (
-                increment_client_send_tick,
-                prepare_messages,
-                collect_mappings,
-                collect_despawns,
-                collect_removals,
-                collect_changes,
-                send_messages,
-                flush_client_send_messages,
-            )
-                .chain()
-                .in_set(ClientSystems::Send)
-                .run_if(in_state(ClientState::Connected)),
-        );
-
-    app.world_mut()
-        .resource_scope(|world, mut messages: Mut<ServerMessages>| {
-            let channels = world.resource::<RepliconChannels>();
-            messages.setup_client_channels(channels.client_channels().len());
-        });
-    app.world_mut().insert_resource(channels);
+        .init_resource::<FilterRegistry>();
 }
 
-fn spawn_client_send_endpoint(
+fn spawn_single_peer_send_endpoint(
     mut commands: Commands,
-    endpoints: Query<Entity, With<ClientSendEndpoint>>,
-    max_size: Res<ClientSendMaxSize>,
+    endpoints: Query<Entity, With<SinglePeerSendEndpoint>>,
+    max_size: Res<SinglePeerSendMaxSize>,
 ) {
     if endpoints.single().is_ok() {
         return;
     }
 
     commands.spawn((
-        ClientSendEndpoint,
+        SinglePeerSendEndpoint,
         ConnectedClient {
             max_size: **max_size,
         },
@@ -723,7 +794,7 @@ fn spawn_client_send_endpoint(
     ));
 }
 
-fn reset_client_send(
+fn reset_single_peer_send(
     mut commands: Commands,
     mut messages: ResMut<ServerMessages>,
     mut server_tick: ResMut<ServerTick>,
@@ -731,7 +802,7 @@ fn reset_client_send(
     mut related_entities: ResMut<RelatedEntities>,
     mut despawn_buffer: ResMut<DespawnBuffer>,
     mut removal_buffer: ResMut<RemovalBuffer>,
-    endpoints: Query<Entity, With<ClientSendEndpoint>>,
+    endpoints: Query<Entity, With<SinglePeerSendEndpoint>>,
 ) {
     messages.clear();
     *server_tick = Default::default();
@@ -744,15 +815,15 @@ fn reset_client_send(
     }
 }
 
-fn increment_client_send_tick(mut server_tick: ResMut<ServerTick>) {
+fn increment_single_peer_send_tick(mut server_tick: ResMut<ServerTick>) {
     server_tick.increment();
 }
 
-fn receive_client_send_acks(
+fn receive_single_peer_send_acks(
     channels: Res<ClientToServerReplicationChannels>,
     mut client_messages: ResMut<ClientMessages>,
     mut server_messages: ResMut<ServerMessages>,
-    endpoint: Query<Entity, With<ClientSendEndpoint>>,
+    endpoint: Query<Entity, With<SinglePeerSendEndpoint>>,
 ) {
     let Ok(endpoint) = endpoint.single() else {
         return;
@@ -763,11 +834,11 @@ fn receive_client_send_acks(
     }
 }
 
-fn flush_client_send_messages(
+fn flush_single_peer_send_messages(
     channels: Res<ClientToServerReplicationChannels>,
     mut client_messages: ResMut<ClientMessages>,
     mut server_messages: ResMut<ServerMessages>,
-    endpoint: Query<Entity, With<ClientSendEndpoint>>,
+    endpoint: Query<Entity, With<SinglePeerSendEndpoint>>,
 ) {
     let Ok(endpoint) = endpoint.single() else {
         return;
@@ -788,7 +859,7 @@ fn flush_client_send_messages(
     });
 }
 
-fn buffer_client_send_removals(
+fn buffer_single_peer_send_removals(
     remove: On<Remove>,
     entities: &Entities,
     archetypes: &Archetypes,
@@ -823,7 +894,7 @@ fn buffer_client_send_removals(
     removals.insert(remove.entity, components, archetype, &registry);
 }
 
-fn buffer_client_send_despawn(
+fn buffer_single_peer_send_despawn(
     remove: On<Remove, Replicated>,
     mut despawn_buffer: ResMut<DespawnBuffer>,
     state: Res<State<ClientState>>,

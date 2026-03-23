@@ -13,14 +13,13 @@ use crate::{
     prelude::*,
     shared::{
         replication::{
-            context::BufferedMutations, receive::receive_replication, send::enable_send_to_server,
-            track_mutate_messages::TrackMutateMessages,
+            context::BufferedMutations, receive::SinglePeerReceivePlugin,
+            send::SinglePeerSendPlugin,
         },
         server_entity_map::ServerEntityMap,
     },
 };
-use confirm_history::EntityReplicated;
-use server_mutate_ticks::{MutateTickReceived, ServerMutateTicks};
+use server_mutate_ticks::ServerMutateTicks;
 
 /// Client functionality and replication receiving.
 ///
@@ -99,25 +98,14 @@ impl Plugin for ClientPlugin {
             );
 
         if self.receive_from_server {
-            app.init_resource::<ServerEntityMap>()
-                .init_resource::<ServerUpdateTick>()
-                .init_resource::<BufferedMutations>()
-                .add_message::<EntityReplicated>()
-                .add_message::<MutateTickReceived>()
-                .add_systems(
-                    PreUpdate,
-                    receive_replication
-                        .in_set(ClientSystems::Receive)
-                        .run_if(in_state(ClientState::Connected)),
-                )
-                .add_systems(
-                    OnEnter(ClientState::Connected),
-                    receive_replication.in_set(ClientSystems::Receive),
-                );
+            app.add_plugins(SinglePeerReceivePlugin);
         }
 
         if self.send_to_server {
-            enable_send_to_server(app, self.mutations_timeout, self.send_max_size);
+            app.add_plugins(SinglePeerSendPlugin {
+                mutations_timeout: self.mutations_timeout,
+                max_size: self.send_max_size,
+            });
         }
 
         app.add_systems(
@@ -144,10 +132,6 @@ impl Plugin for ClientPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        if self.receive_from_server && **app.world().resource::<TrackMutateMessages>() {
-            app.init_resource::<ServerMutateTicks>();
-        }
-
         app.world_mut()
             .resource_scope(|world, mut messages: Mut<ClientMessages>| {
                 let channels = world.resource::<RepliconChannels>();

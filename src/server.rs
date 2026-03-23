@@ -12,9 +12,7 @@ use core::time::Duration;
 
 use bevy::{
     ecs::{entity::EntityHashMap, intern::Interned, schedule::ScheduleLabel},
-    platform::collections::HashSet,
     prelude::*,
-    time::common_conditions::on_timer,
 };
 use log::{Level, debug, log_enabled, trace};
 
@@ -33,21 +31,11 @@ use crate::{
         visibility::registry::FilterRegistry,
     },
     shared::{
-        backend::channels::ClientToServerReplicationChannels,
         message::server_message::message_buffer::MessageBuffer,
         replication::{
             client_ticks::ClientTicks,
-            context::ReceiveContexts,
-            receive::{
-                add_receive_context, enable_receive_from_clients, receive_replication_from_clients,
-                remove_receive_context, sync_receive_contexts,
-            },
-            rules::ReplicationRules,
-            send::{
-                DespawnBuffer, ServerChangeTick, buffer_despawn, buffer_removals,
-                check_mutation_ticks, cleanup_acks, collect_changes, collect_despawns,
-                collect_mappings, collect_removals, prepare_messages, receive_acks, send_messages,
-            },
+            receive::MultiPeerReceivePlugin,
+            send::{DespawnBuffer, MultiPeerSendPlugin, ServerChangeTick},
         },
     },
 };
@@ -153,57 +141,16 @@ impl Plugin for ServerPlugin {
             )
             .add_observer(handle_connect)
             .add_observer(handle_disconnect)
-            .add_observer(add_receive_context)
-            .add_observer(remove_receive_context)
-            .add_systems(
-                PreUpdate,
-                (
-                    sync_receive_contexts
-                        .run_if(resource_exists::<ReceiveContexts>)
-                        .run_if(resource_exists::<ClientToServerReplicationChannels>),
-                    receive_replication_from_clients
-                        .run_if(resource_exists::<ReceiveContexts>)
-                        .run_if(resource_exists::<ClientToServerReplicationChannels>),
-                )
-                    .chain()
-                    .in_set(ServerSystems::Receive)
-                    .run_if(in_state(ServerState::Running)),
-            )
             .add_systems(OnExit(ServerState::Running), reset);
 
         if self.receive_from_clients {
-            enable_receive_from_clients(app);
+            app.add_plugins(MultiPeerReceivePlugin);
         }
 
         if self.send_to_clients {
-            app.add_observer(check_mutation_ticks)
-                .add_observer(buffer_despawn)
-                .add_systems(
-                    PreUpdate,
-                    (
-                        receive_acks,
-                        cleanup_acks(self.mutations_timeout)
-                            .run_if(on_timer(self.mutations_timeout)),
-                    )
-                        .chain()
-                        .in_set(ServerSystems::Receive)
-                        .run_if(in_state(ServerState::Running)),
-                )
-                .add_systems(
-                    PostUpdate,
-                    (
-                        prepare_messages,
-                        collect_mappings,
-                        collect_despawns,
-                        collect_removals,
-                        collect_changes,
-                        send_messages,
-                    )
-                        .chain()
-                        .run_if(resource_changed::<ServerTick>)
-                        .in_set(ServerSystems::Send)
-                        .run_if(in_state(ServerState::Running)),
-                );
+            app.add_plugins(MultiPeerSendPlugin {
+                mutations_timeout: self.mutations_timeout,
+            });
         }
 
         if self.send_to_clients
@@ -237,24 +184,6 @@ impl Plugin for ServerPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        // Multiple rules can include components with the same ID,
-        // we collect them here to deduplicate.
-        let rules = app.world().resource::<ReplicationRules>();
-        let replicated_ids: HashSet<_> = rules
-            .iter()
-            .flat_map(|rule| &rule.components)
-            .map(|component| component.id)
-            .collect();
-
-        // Removal observer without any components will trigger on any removal.
-        if self.send_to_clients && !replicated_ids.is_empty() {
-            let mut remove_observer = Observer::new(buffer_removals);
-            for id in replicated_ids {
-                remove_observer = remove_observer.with_component(id);
-            }
-            app.world_mut().spawn(remove_observer);
-        }
-
         app.world_mut()
             .resource_scope(|world, mut messages: Mut<ServerMessages>| {
                 let channels = world.resource::<RepliconChannels>();

@@ -11,6 +11,7 @@ use crate::{
             ctx::{ClientReceiveCtx, ClientSendCtx},
             registry::RemoteMessageRegistry,
         },
+        replication::receive::receive_replication,
         server_entity_map::ServerEntityMap,
     },
 };
@@ -137,14 +138,14 @@ impl Plugin for ClientMessagePlugin {
                     trigger_fn,
                 )
                     .chain()
-                    .after(super::receive_replication)
+                    .after(receive_replication)
                     .in_set(ClientSystems::Receive),
             )
             .add_systems(
                 OnEnter(ClientState::Connected),
                 (enter_receive_fn, enter_trigger_fn)
                     .chain()
-                    .after(super::receive_replication)
+                    .after(receive_replication)
                     .in_set(ClientSystems::Receive),
             )
             .add_systems(

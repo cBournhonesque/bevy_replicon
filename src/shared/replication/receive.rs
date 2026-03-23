@@ -5,24 +5,23 @@ use postcard::experimental::max_size::MaxSize;
 
 use crate::{
     client::{
-        ClientReplicationStats, Remote, ServerUpdateTick,
+        ClientReplicationStats, ClientSystems, Remote, ServerUpdateTick,
         confirm_history::{ConfirmHistory, EntityReplicated},
-        server_mutate_ticks::MutateTickReceived,
+        server_mutate_ticks::{MutateTickReceived, ServerMutateTicks},
     },
     postcard_utils,
     prelude::*,
+    server::ServerSystems,
     shared::{
-        backend::{
-            channels::{
-                ClientChannel, ClientToServerReplicationChannels, ServerChannel,
-                ensure_client_to_server_replication_channels,
-            },
-            server_messages::ServerMessages,
+        backend::channels::{
+            ClientChannel, ClientToServerReplicationChannels, ServerChannel,
+            ensure_client_to_server_replication_channels,
         },
         replication::{
             RemoteEntity, ReplicatedFrom,
             context::{
-                BufferedMutate, ReceiveContext, ReceiveContexts, ReceiveState, with_receive_context,
+                BufferedMutate, BufferedMutations, ReceiveContext, ReceiveContexts, ReceiveState,
+                with_receive_context,
             },
             deferred_entity::{DeferredChanges, DeferredEntity},
             mutate_index::MutateIndex,
@@ -39,33 +38,65 @@ use crate::{
     },
 };
 
-/// Enables internal server-side receiving for client-to-server replication.
-///
-/// This is intentionally crate-private until the public opt-in API lands.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn enable_receive_from_clients(app: &mut App) -> ClientToServerReplicationChannels {
-    let channels = ensure_client_to_server_replication_channels(app.world_mut());
-    app.world_mut().init_resource::<ReceiveContexts>();
-    app.world_mut()
-        .resource_scope(|world, mut messages: Mut<ServerMessages>| {
-            let channels = world.resource::<RepliconChannels>();
-            messages.setup_client_channels(channels.client_channels().len());
-        });
+pub(crate) struct SinglePeerReceivePlugin;
 
-    let track_mutate_messages = *app.world().resource::<TrackMutateMessages>();
-    let existing_clients = app
-        .world_mut()
-        .query_filtered::<Entity, With<ConnectedClient>>()
-        .iter(app.world())
-        .collect::<Vec<_>>();
-    let mut contexts = app.world_mut().resource_mut::<ReceiveContexts>();
-    for client in existing_clients {
-        contexts
-            .entry(client)
-            .or_insert_with(|| ReceiveState::new(track_mutate_messages));
+impl Plugin for SinglePeerReceivePlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<ServerEntityMap>()
+            .init_resource::<ServerUpdateTick>()
+            .init_resource::<BufferedMutations>()
+            .add_message::<EntityReplicated>()
+            .add_message::<MutateTickReceived>()
+            .add_systems(
+                PreUpdate,
+                receive_replication
+                    .in_set(ClientSystems::Receive)
+                    .run_if(in_state(ClientState::Connected)),
+            )
+            .add_systems(
+                OnEnter(ClientState::Connected),
+                receive_replication.in_set(ClientSystems::Receive),
+            );
     }
 
-    channels
+    fn finish(&self, app: &mut App) {
+        if **app.world().resource::<TrackMutateMessages>() {
+            app.init_resource::<ServerMutateTicks>();
+        }
+    }
+}
+
+pub(crate) struct MultiPeerReceivePlugin;
+
+impl Plugin for MultiPeerReceivePlugin {
+    fn build(&self, app: &mut App) {
+        ensure_client_to_server_replication_channels(app.world_mut());
+        app.init_resource::<ReceiveContexts>()
+            .add_observer(add_peer_receive_context)
+            .add_observer(remove_peer_receive_context)
+            .add_systems(
+                PreUpdate,
+                (sync_peer_receive_contexts, receive_replication_from_peers)
+                    .chain()
+                    .in_set(ServerSystems::Receive)
+                    .run_if(in_state(ServerState::Running)),
+            );
+    }
+
+    fn finish(&self, app: &mut App) {
+        let track_mutate_messages = *app.world().resource::<TrackMutateMessages>();
+        let existing_clients = app
+            .world_mut()
+            .query_filtered::<Entity, With<ConnectedClient>>()
+            .iter(app.world())
+            .collect::<Vec<_>>();
+        let mut contexts = app.world_mut().resource_mut::<ReceiveContexts>();
+        for client in existing_clients {
+            contexts
+                .entry(client)
+                .or_insert_with(|| ReceiveState::new(track_mutate_messages));
+        }
+    }
 }
 
 /// Receives and applies replication messages from the server.
@@ -109,7 +140,7 @@ pub(crate) fn receive_replication(
 }
 
 /// Receives and applies replication messages from multiple clients into per-client receive contexts.
-pub(crate) fn receive_replication_from_clients(
+pub(crate) fn receive_replication_from_peers(
     world: &mut World,
     mut changes: Local<DeferredChanges>,
     mut entity_markers: Local<EntityMarkers>,
@@ -154,7 +185,7 @@ pub(crate) fn receive_replication_from_clients(
     });
 }
 
-pub(crate) fn add_receive_context(
+pub(crate) fn add_peer_receive_context(
     add: On<Add, ConnectedClient>,
     contexts: Option<ResMut<ReceiveContexts>>,
     track_mutate_messages: Res<TrackMutateMessages>,
@@ -166,7 +197,7 @@ pub(crate) fn add_receive_context(
     contexts.insert(add.entity, ReceiveState::new(*track_mutate_messages));
 }
 
-pub(crate) fn remove_receive_context(
+pub(crate) fn remove_peer_receive_context(
     remove: On<Remove, ConnectedClient>,
     mut commands: Commands,
     contexts: Option<ResMut<ReceiveContexts>>,
@@ -194,7 +225,7 @@ pub(crate) fn remove_receive_context(
     }
 }
 
-pub(crate) fn sync_receive_contexts(
+pub(crate) fn sync_peer_receive_contexts(
     mut contexts: ResMut<ReceiveContexts>,
     clients: Query<Entity, With<ConnectedClient>>,
     track_mutate_messages: Res<TrackMutateMessages>,
@@ -1021,6 +1052,7 @@ mod tests {
             },
             ServerPlugin::new(PostUpdate),
             ServerMessagePlugin,
+            MultiPeerReceivePlugin,
         ))
         .replicate::<Marker>()
         .replicate::<BoolComponent>();
@@ -1029,7 +1061,7 @@ mod tests {
         }
         app.finish();
 
-        let channels = enable_receive_from_clients(&mut app);
+        let channels = *app.world().resource::<ClientToServerReplicationChannels>();
 
         (app, channels)
     }

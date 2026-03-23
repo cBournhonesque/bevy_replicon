@@ -12,7 +12,7 @@ use crate::{
             registry::RemoteMessageRegistry,
             server_message::message_buffer::MessageBuffer,
         },
-        replication::client_ticks::ClientTicks,
+        replication::{client_ticks::ClientTicks, send::send_messages},
     },
 };
 
@@ -109,7 +109,7 @@ impl Plugin for ServerMessagePlugin {
                     send_locally_fn.run_if(in_state(ClientState::Disconnected)),
                 )
                     .chain()
-                    .after(super::send_messages)
+                    .after(send_messages)
                     .in_set(ServerSystems::Send),
             );
     }
