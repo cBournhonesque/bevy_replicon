@@ -1,7 +1,10 @@
 use core::ptr::NonNull;
 
 use bevy::{
-    ecs::component::{ComponentId, Mutable},
+    ecs::{
+        component::{ComponentId, Mutable},
+        query::{QueryAccessError, ReleaseStateQueryData},
+    },
     prelude::*,
     ptr::OwningPtr,
 };
@@ -50,12 +53,53 @@ impl<'w> DeferredEntity<'w> {
         self
     }
 
+    /// Like [`EntityWorldMut::remove_with_requires`], but accepts only a single component and buffers it.
+    ///
+    /// Calling this function multiple times for different components is equivalent to removing a bundle with them.
+    pub fn remove_with_requires<C: Component>(&mut self) -> &mut Self {
+        let component_id = self.register_component::<C>();
+        self.changes.removals.push(component_id);
+
+        let components = self.entity.world().components();
+        // SAFETY: the ID was registered above.
+        let info = unsafe { components.get_info_unchecked(component_id) };
+        for required_id in info.required_components().iter_ids() {
+            self.changes.removals.push(required_id);
+        }
+
+        self
+    }
+
     /// Gets mutable access to the component of type `C` for the current entity.
     ///
     /// Returns `None` if the entity does not have a component of type `C`.
     #[inline]
     pub fn get_mut<C: Component<Mutability = Mutable>>(&mut self) -> Option<Mut<'_, C>> {
         self.entity.get_mut()
+    }
+
+    /// Returns components for the current entity that match the query `Q`.
+    ///
+    /// For more details, see [`EntityWorldMut::get_components_mut`].
+    #[inline]
+    pub fn get_components_mut<Q: ReleaseStateQueryData>(
+        &mut self,
+    ) -> Result<Q::Item<'_, 'static>, QueryAccessError> {
+        self.entity.get_components_mut::<Q>()
+    }
+
+    /// Like [`Self::get_components_mut_unchecked`], but doesn't check for aliasing.
+    ///
+    /// For more details, see [`EntityWorldMut::get_components_mut`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `Q` does not provide aliasing mutable references to the same component.
+    #[inline]
+    pub unsafe fn get_components_mut_unchecked<Q: ReleaseStateQueryData>(
+        &mut self,
+    ) -> Result<Q::Item<'_, 'static>, QueryAccessError> {
+        unsafe { self.entity.get_components_mut_unchecked::<Q>() }
     }
 
     fn register_component<C: Component>(&mut self) -> ComponentId {
@@ -163,6 +207,7 @@ mod tests {
 
         entity
             .insert(Unit)
+            .insert(WithRequired)
             .insert(Trivial(1))
             .insert(WithVec(vec![2, 3]))
             .insert(WithBox(Box::new(Trivial(4))))
@@ -171,6 +216,8 @@ mod tests {
         entity.flush();
 
         assert!(entity.get::<Unit>().is_some());
+        assert!(entity.get::<WithRequired>().is_some());
+        assert!(entity.get::<Required>().is_some());
         assert_eq!(**entity.get::<Trivial>().unwrap(), 1);
         assert_eq!(**entity.get::<WithVec>().unwrap(), [2, 3]);
 
@@ -190,6 +237,7 @@ mod tests {
 
         entity
             .remove::<Unit>()
+            .remove_with_requires::<WithRequired>()
             .remove::<Trivial>()
             .remove::<WithVec>()
             .remove::<WithBox>()
@@ -198,6 +246,8 @@ mod tests {
         entity.flush();
 
         assert!(!entity.contains::<Unit>());
+        assert!(!entity.contains::<WithRequired>());
+        assert!(!entity.contains::<Required>());
         assert!(!entity.contains::<Trivial>());
         assert!(!entity.contains::<WithVec>());
         assert!(!entity.contains::<WithBox>());
@@ -211,6 +261,13 @@ mod tests {
 
     #[derive(Component)]
     struct Unit;
+
+    #[derive(Component)]
+    #[require(Required)]
+    struct WithRequired;
+
+    #[derive(Component, Default)]
+    struct Required;
 
     #[derive(Component, Deref)]
     struct Trivial(usize);

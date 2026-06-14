@@ -5,7 +5,7 @@ use bevy::{
         component::{ComponentId, StorageType},
         query::{FilteredAccess, FilteredAccessSet},
         storage::TableId,
-        system::{ReadOnlySystemParam, SystemMeta, SystemParam},
+        system::{SystemMeta, SystemParam},
         world::unsafe_world_cell::UnsafeWorldCell,
     },
     prelude::*,
@@ -42,6 +42,11 @@ impl<'w> ReplicationQuery<'w, '_> {
                 .component_access
                 .access()
                 .has_component_read(component_id)
+                || self
+                    .state
+                    .component_access
+                    .access()
+                    .has_component_write(component_id)
         );
 
         // SAFETY: caller ensured the component is replicated.
@@ -82,9 +87,14 @@ unsafe impl SystemParam for ReplicationQuery<'_, '_> {
 
         let rules = world.resource::<ReplicationRules>();
         debug!("initializing with {} replication rules", rules.len());
-        for rule in rules.iter() {
-            for component in &rule.components {
-                component_access.add_component_read(component.id);
+        if !rules.is_empty() {
+            for rule in rules.iter() {
+                for component in &rule.components {
+                    component_access.add_component_read(component.id);
+                    if let Some(history_id) = component.history_id {
+                        component_access.add_component_write(history_id);
+                    }
+                }
             }
         }
 
@@ -117,8 +127,6 @@ unsafe impl SystemParam for ReplicationQuery<'_, '_> {
         ReplicationQuery { world, state }
     }
 }
-
-unsafe impl ReadOnlySystemParam for ReplicationQuery<'_, '_> {}
 
 pub(crate) struct ReplicationQueryState {
     /// All replicated components.

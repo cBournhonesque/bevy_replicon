@@ -5,7 +5,10 @@ use bytes::Bytes;
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::ctx::{SerializeCtx, WriteCtx};
-use crate::postcard_utils;
+use crate::{
+    postcard_utils,
+    shared::replication::diff::{self, DiffFns, Diffable},
+};
 
 /// Type-erased version of [`RuleFns`].
 ///
@@ -18,6 +21,7 @@ pub(crate) struct UntypedRuleFns {
     deserialize: unsafe fn(),
     deserialize_in_place: unsafe fn(),
     consume: unsafe fn(),
+    diff: Option<DiffFns>,
 }
 
 impl UntypedRuleFns {
@@ -44,7 +48,13 @@ impl UntypedRuleFns {
                 mem::transmute::<unsafe fn(), DeserializeInPlaceFn<C>>(self.deserialize_in_place)
             },
             consume: unsafe { mem::transmute::<unsafe fn(), ConsumeFn<C>>(self.consume) },
+            diff: self.diff,
         }
+    }
+
+    /// Returns diff serialization functions, if enabled for this rule.
+    pub(crate) fn diff(&self) -> Option<DiffFns> {
+        self.diff
     }
 }
 
@@ -62,6 +72,7 @@ impl<C: Component> From<RuleFns<C>> for UntypedRuleFns {
                 mem::transmute::<DeserializeInPlaceFn<C>, unsafe fn()>(value.deserialize_in_place)
             },
             consume: unsafe { mem::transmute::<ConsumeFn<C>, unsafe fn()>(value.consume) },
+            diff: value.diff,
         }
     }
 }
@@ -75,6 +86,8 @@ pub struct RuleFns<C> {
     deserialize: DeserializeFn<C>,
     deserialize_in_place: DeserializeInPlaceFn<C>,
     consume: ConsumeFn<C>,
+    /// Sender-side diff functions, if this rule uses patch-based diff replication.
+    diff: Option<DiffFns>,
 }
 
 impl<C: Component> RuleFns<C> {
@@ -87,6 +100,7 @@ impl<C: Component> RuleFns<C> {
             deserialize,
             deserialize_in_place: in_place_as_deserialize::<C>,
             consume: consume_as_deserialize,
+            diff: None,
         }
     }
 
@@ -161,6 +175,27 @@ impl<C: Component> RuleFns<C> {
     /// Consumes a component from a message.
     pub(super) fn consume(&self, ctx: &mut WriteCtx, message: &mut Bytes) -> Result<()> {
         (self.consume)(self.deserialize, ctx, message)
+    }
+
+    pub(crate) fn diff(&mut self) -> Option<DiffFns> {
+        self.diff
+    }
+}
+
+impl<C: Diffable> RuleFns<C> {
+    /// Creates a new instance for patch-based diff replication.
+    ///
+    /// The regular [`RuleFns`] serializer/deserializer handles snapshot
+    /// payloads. Live receive uses a custom write function registered during
+    /// registry setup so it can handle both snapshots and patches.
+    pub fn new_diff() -> Self {
+        let mut rule_fns = Self::new(
+            diff::serialize_snapshot_without_history::<C>,
+            diff::deserialize_snapshot::<C>,
+        );
+        rule_fns.consume = diff::consume::<C>;
+        rule_fns.diff = Some(DiffFns::new::<C>());
+        rule_fns
     }
 }
 

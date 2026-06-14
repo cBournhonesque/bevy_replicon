@@ -15,6 +15,8 @@ pub struct ComponentRule {
     pub fns_id: FnsId,
     /// Replication configuration.
     pub mode: ReplicationMode,
+    /// Component ID for [`PatchHistory<C>`] associated with the diff component.
+    pub history_id: Option<ComponentId>,
 }
 
 impl ComponentRule {
@@ -24,6 +26,7 @@ impl ComponentRule {
             id,
             fns_id,
             mode: Default::default(),
+            history_id: None,
         }
     }
 }
@@ -58,17 +61,24 @@ pub trait IntoComponentRule {
 }
 
 impl<C: Component<Mutability: MutWrite<C>>> IntoComponentRule for RuleFns<C> {
-    fn into_rule(self, world: &mut World, registry: &mut ReplicationRegistry) -> ComponentRule {
+    fn into_rule(mut self, world: &mut World, registry: &mut ReplicationRegistry) -> ComponentRule {
+        let history_id = self.diff().map(|diff| diff.register(world, registry));
         let (id, fns_id) = registry.register_rule_fns(world, self);
-        ComponentRule::new(id, fns_id)
+        ComponentRule {
+            id,
+            fns_id,
+            mode: Default::default(),
+            history_id,
+        }
     }
 }
 
 impl<C: Component<Mutability: MutWrite<C>>> IntoComponentRule for (RuleFns<C>, ReplicationMode) {
     fn into_rule(self, world: &mut World, registry: &mut ReplicationRegistry) -> ComponentRule {
         let (rule_fns, mode) = self;
-        let (id, fns_id) = registry.register_rule_fns(world, rule_fns);
-        ComponentRule { id, fns_id, mode }
+        let mut rule = rule_fns.into_rule(world, registry);
+        rule.mode = mode;
+        rule
     }
 }
 
@@ -154,6 +164,7 @@ macro_rules! impl_into_bundle_rules {
                                 id,
                                 fns_id,
                                 mode: Default::default(),
+                                history_id: None,
                             }
                         },
                     )*

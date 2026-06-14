@@ -14,6 +14,7 @@ use bevy::{
     ecs::{
         archetype::Archetypes,
         change_detection::{CheckChangeTicks, Tick},
+        component::StorageType,
         entity::{Entities, EntityHash, EntityHashMap},
         intern::Interned,
         schedule::ScheduleLabel,
@@ -33,7 +34,7 @@ use crate::{
         replicated_archetypes::ReplicatedArchetypes,
         replication_messages::{
             mutations::MutationsSplit,
-            serialized_data::{EntityMapping, MessageWrite, WritableComponent},
+            serialized_data::{EntityMapping, MessageWrite, WritableComponent, WritableDiff},
         },
         visibility::registry::FilterRegistry,
     },
@@ -547,7 +548,7 @@ fn collect_removals(
                 }
                 let fns_id_range = fns_id.write_cached(&mut serialized, &mut fns_id_range)?;
                 message.add_removal(fns_id_range);
-                entity_ticks.components.remove(component_index);
+                entity_ticks.remove_component(component_index);
             }
         }
     }
@@ -599,7 +600,7 @@ fn collect_removals(
                 }
                 let fns_id_range = rule.fns_id.write(&mut serialized)?;
                 message.add_removal(fns_id_range);
-                entity_ticks.components.remove(component_index);
+                entity_ticks.remove_component(component_index);
 
                 Ok(())
             };
@@ -686,6 +687,24 @@ fn collect_changes(
                     )
                 };
 
+                let diff = if let Some(diff) = fns.diff() {
+                    let history_id = rule
+                        .history_id
+                        .expect("rules with diff should register history component");
+                    // SAFETY: history component is registered as required and always has table storage.
+                    let (history, _) = unsafe {
+                        query.get_component_unchecked(
+                            entity,
+                            archetype.table_id(),
+                            StorageType::Table,
+                            history_id,
+                        )
+                    };
+                    Some(WritableDiff { fns: diff, history })
+                } else {
+                    None
+                };
+
                 // SAFETY: `fns` and `ptr` were created for the same component type.
                 let component = unsafe {
                     WritableComponent::new(
@@ -737,9 +756,17 @@ fn collect_changes(
                                     entity_range,
                                 );
                             }
-                            let component_range =
-                                component.write_cached(&mut serialized, &mut component_range)?;
-                            mutations.add_component(component_range);
+
+                            let component = component.write_mutation(
+                                &mut serialized,
+                                &mut component_range,
+                                diff,
+                                entity_ticks.patch_cursor(component_index),
+                            )?;
+                            if let Some(cursor) = component.patch_cursor {
+                                mutations.add_patch_cursor(component_index, cursor);
+                            }
+                            mutations.add_component(component.range);
                         }
                     } else {
                         trace!(
@@ -754,8 +781,9 @@ fn collect_changes(
                                 .write_cached(&mut serialized, &mut entity_range)?;
                             updates.add_changed_entity(&mut pools, entity_range);
                         }
-                        let component_range =
-                            component.write_cached(&mut serialized, &mut component_range)?;
+                        let component_range = component
+                            .write_mutation(&mut serialized, &mut component_range, diff, None)?
+                            .range;
                         updates.add_inserted_component(component_range, component_index);
                     }
                 }
@@ -825,11 +853,7 @@ fn update_ticks(
             pools.recycle_components(components);
         }
         Entry::Vacant(entry) => {
-            entry.insert(EntityTicks {
-                server_tick,
-                system_tick,
-                components,
-            });
+            entry.insert(EntityTicks::new(server_tick, system_tick, components));
         }
     }
 }
